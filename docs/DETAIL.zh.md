@@ -5,17 +5,19 @@
 ## 工作流程
 
 ```text
-scrabber（截屏子进程）       DSH 插件主机                     Windows 桌面组件
+scrabber（截屏子进程）       DSH 插件主机                     桌面组件
 screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
                               ├─▶ 调用当前模型生成详细记录
+                              ├─▶ 记录每次请求、发送图片、响应、错误和 token 用量
                               ├─▶ 写入 diary/detail/ 与 state/notes/
+                              ├─▶ 失败时保留截屏并加入待重试队列
                               ├─▶ 更新 state/ledger.json
                               └─▶ 成功落盘后清理已处理的截屏
                                       ▲                         │
                                       └── 本机回环 HTTP + token ─┘
 ```
 
-截屏由随插件提供的 `scrabber` 子进程完成；记录调度、模型调用、文件读写和状态管理由 DSH 插件主机负责。桌面组件只显示状态、日记卡片和接收暂停、继续等操作。
+截屏由随插件提供的 scrabber 子进程完成；记录调度、模型调用、文件读写和状态管理由 DSH 插件主机负责。桌面组件显示状态和日记卡片，DSH 左侧栏中的「每日秘书」面板则查看按天归档的会话、运行日志、请求详情和重试队列。
 
 ## 记录时间窗口
 
@@ -34,7 +36,7 @@ screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
 
 ## 数据目录
 
-默认数据根目录是插件目录；`dataDir` 可以将数据单独放到其他目录。程序仅在数据根目录中创建以下内容：
+默认数据根目录按系统选择：Windows 为 %LOCALAPPDATA%\daily-secretary，macOS 为 ~/Library/Application Support/daily-secretary，Linux 为 $XDG_DATA_HOME/daily-secretary（未设置时使用 ~/.local/share/daily-secretary）。设置页和侧栏面板会显示实际路径；dataDir 可以覆盖默认值。旧版插件目录内的数据会在首次启动时复制到新目录，目标已有数据时不会覆盖。程序仅在数据根目录中创建以下内容：
 
 ```text
 <dataDir>/
@@ -51,10 +53,11 @@ screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
 └─ logs/
    ├─ secretary.log
    ├─ scrabber.log
+   ├─ model-calls.jsonl
    └─ deletions.jsonl
 ```
 
-`ledger.json` 保存记录游标、暂停状态和统计信息；`notes/` 保存每天各段的要点，供每日小结使用；`settings.json` 保存设置页中的覆盖值。`widget.json` 由桌面组件保存窗口位置，插件只读取它；`widget-pid.json` 保存插件启动的组件进程号。
+ledger.json 保存记录游标、暂停状态、失败的详细记录任务与每日小结任务队列；notes/ 保存每天各段的完整内容和要点；settings.json 保存设置页中的覆盖值。model-calls.jsonl 逐次保存模型请求、实际附图路径、响应、错误、耗时和模型返回的用量。widget.json 由桌面组件保存窗口位置，插件只读取它；widget-pid.json 保存插件启动的组件进程号。
 
 ## 两类日记
 
@@ -72,7 +75,9 @@ screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
 ===============YYYY/MM/DD HH:mm:ss===============
 ```
 
-模型请求带有完整截屏时间线，并按 `imageBudget` 选择代表帧。默认每段附带最多 8 张图。正文要求用具体证据和时间点记录观察到的工作；机器可读的 `highlights` 与 `quip` JSON 围栏附在正文之后，用于每日小结。
+模型请求带有完整截屏时间线，并按 `imageBudget` 选择代表帧。默认每段附带最多 8 张图。正文要求用具体证据和时间点记录观察到的工作；机器可读的 `highlights` 与 `quip` JSON 围栏附在正文之后，用于每日小结。用户可以在设置页分别填写总结和吐槽风格提示；提示不能覆盖事实准确性要求。
+
+模型调用失败时，任务和对应截屏路径会先持久化到 ledger.json，保留原图并显示错误、尝试次数和下次重试时间。下个总结周期和插件启动时按顺序重试旧任务，旧任务成功落盘后才清理其截屏；队列里还有失败任务时，不会越过它处理更新的窗口。每日小结有独立重试队列，失败后先写入本地兜底内容。
 
 ### 每日小结
 
@@ -84,7 +89,7 @@ screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
 
 | 配置键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `dataDir` | 插件目录 | 数据根目录 |
+| `dataDir` | 当前用户的数据目录 | 数据根目录 |
 | `scrabberPath` | 自动查找 | 可覆盖内置截屏程序路径；通常不需要设置 |
 | `captureIntervalSeconds` | `20` | 截屏间隔（秒）；界面范围为 2–600 秒 |
 | `includeCursor` | `true` | 是否在 Windows 截屏中包含鼠标指针 |
@@ -96,6 +101,8 @@ screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
 | `digestRefreshMinutes` | `30` | 有新记录后再次刷新小结前的最短间隔 |
 | `segmentMaxTokens` | `3072` | 详细记录的输出 token 上限 |
 | `dailySummaryMaxTokens` | `2048` | 每日小结的输出 token 上限 |
+| `summaryStyle` | `""` | 总结风格提示，最多 500 字 |
+| `quipStyle` | `""` | 吐槽风格提示，最多 500 字 |
 | `widget` | `true` | 是否启用桌面组件 |
 | `registerTool` | `true` | 是否尝试向 Agent 注册 `daily_secretary` 工具 |
 
@@ -142,12 +149,16 @@ screenshots/<日期>/*.png ──▶ 按时间窗口选取截屏和时间线
 | `read` | 读取某天的详细记录 | `day: "YYYY-MM-DD"`，省略时读取今天 |
 | `pause` / `resume` | 暂停或恢复截屏 | — |
 | `settings` | 查看当前设置和模型路由 | — |
-| `configure` | 更改可由界面编辑的设置 | `captureSeconds`、`deltaTMinutes`、`dailyDigestAt`、`provider`、`model` |
-| `open` | 在文件管理器中打开数据目录 | `target: "screenshots"` 或 `"diary"` |
+| `configure` | 更改可由界面编辑的设置 | `captureSeconds`、`deltaTMinutes`、`dailyDigestAt`、`provider`、`model`、`summaryStyle`、`quipStyle` |
+| `open` | 在文件管理器中打开数据目录 | `target: "home"`、`"screenshots"` 或 `"diary"` |
+
+## 每日秘书侧栏面板
+
+面板挂在 DSH 全局左侧栏，按本地日期列出记录，显示每段时间区间、截屏总数、实际发送的图像、总结内容、请求状态和 token 用量；模型请求页可展开查看请求文本、返回文本和错误。运行日志显示最新的持久化 secretary.log 与 scrabber 最近输出，每 5 秒刷新一次。
 
 ## 限制与排错
 
-- 当前随包预编译的截屏程序和桌面组件面向 Windows x64；截屏范围是主显示器。
+- 当前随包预编译的截屏程序和桌面组件面向 Windows x64；Linux 发布包仍缺少对应二进制，因此尚不能即装即用。源码已使用 Linux 用户目录和 xdg-open，桌面组件 crate 已启用 X11 与 Wayland，但需要在 Linux 构建环境产出并随包发布对应的 scrabber 与桌面组件后才能完整启用。截屏范围是主显示器。
 - DSH 未运行期间不会继续截屏。重启时会尝试汇总尚未处理的截屏，但无法记录未产生的画面。
 - 截屏与相关文字会发送给当前选用的模型服务；请留意服务隐私政策和费用。
 - 圆点为黄色时处于暂停状态；单击圆点恢复记录。

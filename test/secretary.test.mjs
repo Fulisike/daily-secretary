@@ -101,7 +101,7 @@ test('the file manager opener is per-platform and never takes a path from the ca
   assert.equal(broken.ok, false)
   assert.match(broken.error, /nope/)
   assert.equal(revealDirectory('/x', { platform: 'aix', spawner }).ok, false)
-  assert.deepEqual(REVEAL_TARGETS, ['screenshots', 'diary'])
+  assert.deepEqual(REVEAL_TARGETS, ['home', 'screenshots', 'diary'])
 })
 
 test('scrabber file names carry the capture instant', () => {

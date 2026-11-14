@@ -13,6 +13,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { Config, parseConfig } from './lib/config.js'
 import { analyzeSegment, composeDailyDigest, fallbackDigest } from './lib/analysis.js'
@@ -20,7 +21,7 @@ import { appendDetailSegment, writeDailyDigest } from './lib/diary.js'
 import { deleteScreenshots } from './lib/cleanup.js'
 import { clockReached, coveredDays, parseClock, planFlush, planWindow } from './lib/framing.js'
 import { loadLedger, readJsonSync, writeJsonAtomic } from './lib/ledger.js'
-import { dayKey, ensureStore, resolveStore, stamp } from './lib/paths.js'
+import { dayKey, ensureStore, migrateLegacyData, resolveStore, stamp, userDataDir } from './lib/paths.js'
 import { CaptureRunner, locateScrabber } from './lib/scrabber.js'
 import { startWidgetServer } from './lib/server.js'
 import { listShots } from './lib/shots.js'
@@ -35,7 +36,7 @@ export { Config }
 const TICK_MS = 15_000
 const DIGEST_POLL_MS = 30_000
 
-/** Plugin package directory; the default storage root lives here. */
+/** Plugin package directory; executables live here, user data does not. */
 const PLUGIN_DIR = fs.realpathSync(path.dirname(fileURLToPath(import.meta.url)))
 
 /** A logger that also keeps a file trail next to the data. */
@@ -82,8 +83,83 @@ function profileSelection(ctx) {
   }
 }
 
+let modelCallsCache = { file: null, size: -1, modifiedAt: -1, calls: [] }
+
+function readModelCalls(file) {
+  try {
+    const stat = fs.statSync(file)
+    if (modelCallsCache.file === file && modelCallsCache.size === stat.size && modelCallsCache.modifiedAt === stat.mtimeMs) {
+      return modelCallsCache.calls
+    }
+  } catch {
+    return []
+  }
+  let lines
+  try { lines = fs.readFileSync(file, 'utf8').split(/\r?\n/) } catch { return [] }
+  const calls = new Map()
+  for (const line of lines) {
+    if (line.trim() === '') continue
+    try {
+      const event = JSON.parse(line)
+      if (typeof event?.id !== 'string') continue
+      calls.set(event.id, { ...(calls.get(event.id) ?? {}), ...event })
+    } catch { /* ignore a partial final line */ }
+  }
+  const result = [...calls.values()].sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
+  const stat = fs.statSync(file)
+  modelCallsCache = { file, size: stat.size, modifiedAt: stat.mtimeMs, calls: result }
+  return result
+}
+
+function readLogTail(file, { maxBytes = 128 * 1024, maxLines = 200 } = {}) {
+  let fd
+  try {
+    const size = fs.statSync(file).size
+    const length = Math.min(size, maxBytes)
+    const buffer = Buffer.alloc(length)
+    fd = fs.openSync(file, 'r')
+    fs.readSync(fd, buffer, 0, length, size - length)
+    return buffer.toString('utf8').split(/\r?\n/).filter(Boolean).slice(-maxLines)
+  } catch {
+    return []
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+function usageTotals(calls) {
+  const totals = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, reportedCalls: 0, unreportedCalls: 0 }
+  for (const call of calls) {
+    if (call.phase !== 'complete') continue
+    const usage = call.usage
+    if (usage === null || typeof usage !== 'object') {
+      totals.unreportedCalls += 1
+      continue
+    }
+    const input = Number.isFinite(usage.inputTokens) ? usage.inputTokens : 0
+    const output = Number.isFinite(usage.outputTokens) ? usage.outputTokens : 0
+    const cacheRead = Number.isFinite(usage.cacheReadTokens) ? usage.cacheReadTokens : 0
+    const cacheWrite = Number.isFinite(usage.cacheWriteTokens) ? usage.cacheWriteTokens : 0
+    totals.inputTokens += input
+    totals.outputTokens += output
+    totals.cacheReadTokens += cacheRead
+    totals.cacheWriteTokens += cacheWrite
+    totals.totalTokens += Number.isFinite(usage.totalTokens) ? usage.totalTokens : input + output
+    totals.reportedCalls += 1
+  }
+  return totals
+}
+
+function validDay(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const time = new Date(`${value}T12:00:00`).getTime()
+  return Number.isFinite(time) && dayKey(time) === value
+}
+
 class Secretary {
-  constructor(ctx, config, logger) {
+  constructor(ctx, config, logger, store) {
     this.ctx = ctx
     this.config = config
     this.logger = logger
@@ -94,8 +170,10 @@ class Secretary {
       dailyDigestAt: config.dailyDigestAt,
       provider: config.provider,
       model: config.model,
+      summaryStyle: config.summaryStyle,
+      quipStyle: config.quipStyle,
     }
-    this.store = resolveStore({ rootDir: config.dataDir ?? PLUGIN_DIR })
+    this.store = store
     ensureStore(this.store)
 
     this.lifetime = new AbortController()
@@ -118,6 +196,7 @@ class Secretary {
     this.digestRetryAt = 0
     this.timers = []
     this.disposed = false
+    this.recovering = false
     this.busy = false
   }
 
@@ -146,13 +225,17 @@ class Secretary {
     this.config.dailyDigestAt = effective.dailyDigestAt
     this.config.provider = effective.provider
     this.config.model = effective.model
+    this.config.summaryStyle = effective.summaryStyle
+    this.config.quipStyle = effective.quipStyle
     this.settingsOrigin = Object.keys(saved).length > 0 ? 'gui' : 'config'
 
     await this.#resolveRoute()
 
     const scrabberPath = locateScrabber({ configured: this.config.scrabberPath, pluginDir: PLUGIN_DIR })
     if (scrabberPath === null) {
-      this.captureMissing = 'bundled scrabber executable not found — reinstall daily-secretary'
+      this.captureMissing = process.platform === 'linux'
+        ? 'Linux 版 scrabber 尚未随包发布'
+        : 'bundled scrabber executable not found — reinstall daily-secretary'
       this.logger.error('daily-secretary: %s', this.captureMissing)
     } else {
       this.logger.info('daily-secretary: scrabber at %s', scrabberPath)
@@ -171,14 +254,29 @@ class Secretary {
     await this.#startWidget()
     this.#registerSettingsRoute()
 
+    // Recovery can include model calls. Do not hold DSH's plugin startup open
+    // while those requests run; the timers stay inert until reconciliation ends.
+    this.recovering = true
+    this.#schedule()
+    this.#watchWidget(now)
+    this.startupTask = this.#finishStartup(now, fresh)
+      .catch((error) => this.logger.error('daily-secretary: startup recovery failed (%s)', error?.message ?? error))
+      .finally(() => {
+        this.recovering = false
+        this.startupTask = null
+        if (!this.disposed) this.#tick().catch((error) => this.logger.error('daily-secretary: first tick failed (%s)', error?.message ?? error))
+      })
+  }
+
+  async #finishStartup(now, fresh) {
     await this.#recover(now)
+    if (this.disposed) return
     if (this.ledger.capture === 'recording') this.#ensureCapture()
     else if (fresh) this.logger.info('daily-secretary: starting paused — click the dot to begin recording')
     else this.logger.info('daily-secretary: capture stays paused, as the user left it')
 
     await this.#catchUpDigests(now)
-    this.#schedule()
-    this.#watchWidget(Date.now())
+    if (this.disposed) return
     this.logger.info('daily-secretary: ready (T=%s)', stamp(this.ledger.cursor))
   }
 
@@ -193,7 +291,7 @@ class Secretary {
       const day = dayKey(now - back * 86_400_000)
       if (day === today) continue
       if (this.readNotes(day).length === 0) continue
-      if (fs.existsSync(path.join(this.store.daily, `${day}.md`))) continue
+      if (fs.existsSync(path.join(this.store.daily, `${day}.md`)) && !this.ledger.pendingDigests.some((job) => job.day === day)) continue
       this.logger.info('daily-secretary: writing the missed daily piece for %s', day)
       await this.#produceDigest({ day, reason: 'catchup', now })
     }
@@ -212,6 +310,12 @@ class Secretary {
     if (ledger.cursor > now) {
       this.logger.warn('daily-secretary: ledger cursor was in the future; resetting it')
       ledger.cursor = now
+    }
+    if (ledger.pendingSummaries.length > 0) {
+      const job = ledger.pendingSummaries[0]
+      this.logger.info('daily-secretary: retrying %s queued summary job(s) after restart', ledger.pendingSummaries.length)
+      await this.#summarize({ start: job.start, end: now, reason: 'resume-retry' })
+      if (ledger.pendingSummaries.length > 0) return
     }
     const pending = await listShots(this.store.screenshots, { from: ledger.cursor, to: now })
     if (pending.files.length === 0) {
@@ -378,6 +482,8 @@ class Secretary {
       dailyDigestAt: this.config.dailyDigestAt,
       provider: this.config.provider,
       model: this.config.model,
+      summaryStyle: this.config.summaryStyle,
+      quipStyle: this.config.quipStyle,
     }
     const parsed = parseSettingsPatch(patch, base)
     if (parsed.ok !== true) return { ok: false, error: parsed.error }
@@ -399,6 +505,8 @@ class Secretary {
     this.config.dailyDigestAt = parsed.value.dailyDigestAt
     this.config.provider = parsed.value.provider
     this.config.model = parsed.value.model
+    this.config.summaryStyle = parsed.value.summaryStyle
+    this.config.quipStyle = parsed.value.quipStyle
     this.settingsOrigin = 'gui'
     if (intervalChanged) await this.#restartCaptureIfRunning()
     await this.#resolveRoute()
@@ -434,6 +542,8 @@ class Secretary {
     this.config.dailyDigestAt = this.defaults.dailyDigestAt
     this.config.provider = this.defaults.provider
     this.config.model = this.defaults.model
+    this.config.summaryStyle = this.defaults.summaryStyle
+    this.config.quipStyle = this.defaults.quipStyle
     this.settingsOrigin = 'config'
     await this.#restartCaptureIfRunning()
     await this.#resolveRoute()
@@ -451,7 +561,11 @@ class Secretary {
     if (!REVEAL_TARGETS.includes(target)) {
       return { ok: false, error: `只能打开 ${REVEAL_TARGETS.join(' 或 ')}` }
     }
-    const directory = target === 'screenshots' ? this.store.screenshots : this.store.diary
+    const directory = target === 'home'
+      ? this.store.root
+      : target === 'screenshots'
+        ? this.store.screenshots
+        : this.store.diary
     try {
       fs.mkdirSync(directory, { recursive: true })
     } catch (error) {
@@ -474,8 +588,11 @@ class Secretary {
         dailyDigestAt: this.config.dailyDigestAt,
         provider: this.config.provider,
         model: this.config.model,
+        summaryStyle: this.config.summaryStyle,
+        quipStyle: this.config.quipStyle,
       },
       dirs: {
+        home: this.store.root,
         screenshots: this.store.screenshots,
         diary: this.store.diary,
       },
@@ -493,10 +610,127 @@ class Secretary {
         lastSummaryAt: this.ledger?.lastSummaryAt ?? null,
         pendingShots: shots.files.length,
         lastError: this.ledger?.stats?.lastError ?? null,
+        pendingSummaries: this.ledger?.pendingSummaries?.length ?? 0,
+        pendingDigests: this.ledger?.pendingDigests?.length ?? 0,
+        nextRetryAt: this.nextRetryAt || this.digestRetryAt || null,
       },
       store: this.store.root,
       notice: this.captureMissing,
     }
+  }
+
+  #recordModelCall(event) {
+    try {
+      fs.mkdirSync(this.store.logs, { recursive: true })
+      fs.appendFileSync(path.join(this.store.logs, 'model-calls.jsonl'), `${JSON.stringify(event)}\n`, 'utf8')
+    } catch (error) {
+      this.logger.warn('daily-secretary: cannot persist model call details (%s)', error?.message ?? error)
+    }
+    if (event.phase === 'start') {
+      this.logger.info('daily-secretary: model request %s started (%s/%s, %s images)', event.id, event.provider, event.model, event.sentImages?.length ?? 0)
+    } else if (event.status === 'success') {
+      this.logger.info('daily-secretary: model request %s succeeded (%s tokens)', event.id, event.usage?.totalTokens ?? '?')
+    } else {
+      this.logger.error('daily-secretary: model request %s failed (%s: %s)', event.id, event.error?.code ?? 'ERROR', event.error?.message ?? 'unknown error')
+    }
+  }
+
+  async overviewSnapshot(requestedDay) {
+    const today = dayKey(Date.now())
+    const day = validDay(requestedDay) ? requestedDay : today
+    const allCalls = readModelCalls(path.join(this.store.logs, 'model-calls.jsonl'))
+    const daySet = new Set([today, ...allCalls.map((call) => call.day).filter(validDay)])
+    const callsByDay = new Map()
+    for (const call of allCalls) {
+      const calls = callsByDay.get(call.day) ?? []
+      calls.push(call)
+      callsByDay.set(call.day, calls)
+    }
+    const addDaysFromDir = (directory) => {
+      try {
+        for (const name of fs.readdirSync(directory)) {
+          const match = /^(\d{4}-\d{2}-\d{2})(?:\.json|\.md)$/.exec(name)
+          if (match && validDay(match[1])) daySet.add(match[1])
+        }
+      } catch { /* directory may not exist yet */ }
+    }
+    addDaysFromDir(this.notesDir)
+    addDaysFromDir(this.store.daily)
+    for (const job of this.ledger?.pendingSummaries ?? []) daySet.add(dayKey(job.start))
+    for (const job of this.ledger?.pendingDigests ?? []) daySet.add(job.day)
+
+    const days = [...daySet].sort((a, b) => b.localeCompare(a)).slice(0, 90).map((key) => {
+      const notes = this.readNotes(key)
+      const calls = callsByDay.get(key) ?? []
+      let digestTitle = ''
+      try { digestTitle = fs.readFileSync(path.join(this.store.daily, `${key}.md`), 'utf8').split(/\r?\n/, 1)[0].replace(/^#\s*/, '') } catch { /* no digest */ }
+      return {
+        day: key,
+        title: digestTitle,
+        segments: notes.length,
+        screenshots: notes.reduce((sum, note) => sum + (Number.isFinite(note.totalShots) ? note.totalShots : 0), 0)
+          + (this.ledger?.pendingSummaries ?? []).filter((job) => dayKey(job.start) === key)
+            .reduce((sum, job) => sum + (job.files?.length ?? 0), 0),
+        requests: calls.filter((call) => call.phase === 'complete').length,
+        failures: calls.filter((call) => call.phase === 'complete' && call.status === 'failed').length,
+        tokens: usageTotals(calls).totalTokens,
+      }
+    })
+
+    const calls = (callsByDay.get(day) ?? []).slice(-100).reverse()
+    const notes = this.readNotes(day)
+    let digest = null
+    let detailDocument = ''
+    try { digest = fs.readFileSync(path.join(this.store.daily, `${day}.md`), 'utf8') } catch { /* no daily piece yet */ }
+    try { detailDocument = fs.readFileSync(path.join(this.store.detail, `${day}.md`), 'utf8') } catch { /* no detail yet */ }
+    const [year, month, date] = day.split('-').map(Number)
+    const dayStart = new Date(year, month - 1, date).getTime()
+    const dayEnd = new Date(year, month - 1, date + 1).getTime()
+    const todayShots = await listShots(this.store.screenshots, { from: dayStart - 1, to: dayEnd })
+    const pendingShots = todayShots.files
+    const eventLog = readLogTail(path.join(this.store.logs, 'secretary.log'))
+    return {
+      ok: true,
+      day,
+      days,
+      session: {
+        day,
+        segments: notes,
+        digest,
+        detailDocument,
+        requests: calls,
+        usage: usageTotals(calls),
+      },
+      runtime: {
+        capture: this.captureState,
+        route: this.route,
+        vision: this.routeVision,
+        home: this.store.root,
+        usage: usageTotals(allCalls),
+        pendingShots: pendingShots.length,
+        pendingSummaries: this.ledger?.pendingSummaries ?? [],
+        pendingDigests: this.ledger?.pendingDigests ?? [],
+        nextRetryAt: this.nextRetryAt || this.digestRetryAt || null,
+        lastError: this.ledger?.stats?.lastError ?? null,
+        scrabber: this.runner?.snapshot() ?? null,
+        widget: this.widget?.snapshot() ?? null,
+        events: eventLog.length > 0 ? eventLog : this.logger.recent(),
+      },
+    }
+  }
+
+  async retryPending() {
+    if (this.recovering) return { ok: false, error: '正在整理上次的记录，请稍后再操作' }
+    if (this.busy) return { ok: false, error: '当前模型请求尚未结束' }
+    const now = Date.now()
+    if ((this.ledger?.pendingSummaries?.length ?? 0) > 0) {
+      const end = Math.max(now, ...this.ledger.pendingSummaries.map((job) => job.end))
+      await this.#summarize({ start: this.ledger.cursor, end, reason: 'manual-retry' })
+    }
+    for (const job of [...(this.ledger?.pendingDigests ?? [])]) {
+      await this.#produceDigest({ day: job.day, reason: 'manual-retry', now })
+    }
+    return { ok: true, snapshot: await this.overviewSnapshot(dayKey(now)) }
   }
 
   /**
@@ -591,6 +825,36 @@ class Secretary {
           send({ ok: false, error: String(error?.message ?? error) }, 500)
         }
       })
+      return
+    }
+    if (url.pathname === '/daily-secretary/overview') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        try { response.writeHead(405, { allow: 'GET, HEAD' }); response.end() } catch { /* ignore */ }
+        return
+      }
+      this.overviewSnapshot(url.searchParams.get('day'))
+        .then((snapshot) => send(snapshot))
+        .catch((error) => {
+          this.logger.warn('daily-secretary: overview read failed (%s)', error?.message ?? error)
+          send({ ok: false, error: '读取每日记录失败' }, 500)
+        })
+      return
+    }
+    if (url.pathname === '/daily-secretary/retry') {
+      if (request.method !== 'POST') {
+        try { response.writeHead(405, { allow: 'POST' }); response.end() } catch { /* ignore */ }
+        return
+      }
+      const origin = request.headers.origin
+      if (this.webOrigin !== null && typeof origin === 'string' && origin !== this.webOrigin) {
+        return send({ ok: false, error: 'cross-origin request refused' }, 403)
+      }
+      this.retryPending()
+        .then((result) => send(result, result.ok === true ? 200 : 409))
+        .catch((error) => {
+          this.logger.warn('daily-secretary: retry request failed (%s)', error?.message ?? error)
+          send({ ok: false, error: String(error?.message ?? error) }, 500)
+        })
       return
     }
     if (url.pathname !== '/daily-secretary/settings' && url.pathname !== '/daily-secretary/settings/') {
@@ -696,6 +960,7 @@ class Secretary {
   /** Pause: stop capture, then flush everything captured so far. */
   async pause(reason = 'user') {
     if (this.ledger === null) return { ok: false, error: 'not ready' }
+    if (this.recovering) return { ok: false, error: '正在整理上次的记录，请稍后再操作' }
     if (this.ledger.capture === 'paused') return { ok: true, state: this.#state() }
     this.ledger.capture = 'paused'
     await this.#persist()
@@ -715,16 +980,19 @@ class Secretary {
   /** Resume: pending screenshots are caught up first, then `T` becomes now. */
   async resume(reason = 'user') {
     if (this.ledger === null) return { ok: false, error: 'not ready' }
+    if (this.recovering) return { ok: false, error: '正在整理上次的记录，请稍后再操作' }
     const now = Date.now()
     this.ledger.capture = 'recording'
     await this.#persist()
     const pending = await listShots(this.store.screenshots, { from: this.ledger.cursor, to: now })
-    if (pending.files.length > 0) {
+    if (pending.files.length > 0 || this.ledger.pendingSummaries.length > 0) {
       await this.#summarize({ start: this.ledger.cursor, end: now, reason: `resume:${reason}` })
     }
-    this.ledger.cursor = now
-    this.ledger.cursorDay = dayKey(now)
-    await this.#persist()
+    if (this.ledger.pendingSummaries.length === 0 && this.ledger.cursor < now) {
+      this.ledger.cursor = now
+      this.ledger.cursorDay = dayKey(now)
+      await this.#persist()
+    }
     this.#ensureCapture()
     this.logger.info('daily-secretary: capture resumed (%s), T=%s', reason, stamp(now))
     return { ok: true, state: this.#state() }
@@ -733,7 +1001,7 @@ class Secretary {
   // ---------------------------------------------------------------- recording
 
   async #tick() {
-    if (this.disposed || this.ledger === null || this.busy) return
+    if (this.disposed || this.recovering || this.ledger === null || this.busy) return
     this.ledger.lastTickAt = Date.now()
     const now = Date.now()
 
@@ -747,7 +1015,7 @@ class Secretary {
         deltaMs: this.config.deltaTSeconds * 1_000,
         minWindowMs: this.config.minWindowSeconds * 1_000,
       })
-      if (window !== null) {
+      if (window !== null && now >= this.nextRetryAt) {
         await this.#summarize({ ...window, reason: window.reason })
         return
       }
@@ -776,92 +1044,145 @@ class Secretary {
    * evidence on disk.
    */
   async #summarize({ start, end, reason }) {
-    const shots = await listShots(this.store.screenshots, { from: start, to: end })
-
-    if (shots.files.length === 0) {
-      this.ledger.cursor = end
-      this.ledger.cursorDay = dayKey(end)
-      await this.#persist()
-      this.logger.info('daily-secretary: window %s had no screenshots (%s)', stamp(start), reason)
-      return { skipped: true }
-    }
-
-    if (this.route === null) {
-      this.logger.warn('daily-secretary: keeping %s screenshots; no model route configured', shots.files.length)
-      return { skipped: true, reason: 'no route' }
-    }
-
+    if (this.ledger === null || this.busy) return { skipped: true, reason: 'busy' }
     this.busy = true
     try {
-      const days = coveredDays(start, end)
+      for (const job of [...this.ledger.pendingSummaries]) {
+        const retried = await this.#runSummaryJob(job)
+        if (retried.ok !== true) {
+          this.nextRetryAt = Date.now() + this.config.deltaTSeconds * 1_000
+          return { skipped: true, reason: 'queued summary failed' }
+        }
+      }
+
+      const currentStart = Math.max(start, this.ledger.cursor)
+      if (currentStart >= end) return { skipped: true, reason: 'window already covered' }
+      const shots = await listShots(this.store.screenshots, { from: currentStart, to: end })
+      if (shots.files.length === 0) {
+        this.ledger.cursor = end
+        this.ledger.cursorDay = dayKey(end)
+        await this.#persist()
+        this.logger.info('daily-secretary: window %s had no screenshots (%s)', stamp(currentStart), reason)
+        return { skipped: true }
+      }
+
+      const job = {
+        id: randomUUID(),
+        start: currentStart,
+        end,
+        reason,
+        queuedAt: Date.now(),
+        attempts: 0,
+        lastAttemptAt: null,
+        lastError: null,
+        files: shots.files,
+      }
+      this.ledger.pendingSummaries.push(job)
+      await this.#persist()
+      return await this.#runSummaryJob(job)
+    } finally {
+      this.busy = false
+    }
+  }
+
+  async #runSummaryJob(job) {
+    job.attempts += 1
+    job.lastAttemptAt = Date.now()
+    job.lastError = null
+    await this.#persist()
+    try {
+      const day = dayKey(job.start)
+      const existing = this.readNotes(day).find((note) => note.jobId === job.id)
+      if (existing) {
+        this.ledger.cursor = Math.max(this.ledger.cursor, job.end)
+        this.ledger.cursorDay = dayKey(this.ledger.cursor)
+        this.ledger.pendingSummaries = this.ledger.pendingSummaries.filter((entry) => entry.id !== job.id)
+        await this.#persist()
+        const removal = deleteScreenshots(this.store, job.files, {
+          auditFile: path.join(this.store.logs, 'deletions.jsonl'),
+        })
+        this.ledger.stats.deletedShots += removal.deleted.length
+        await this.#persist()
+        this.nextRetryAt = 0
+        return { ok: true, recovered: true }
+      }
+      if (this.route === null) throw Object.assign(new Error('没有可用的模型路由'), { code: 'NO_MODEL_ROUTE' })
+
+      const days = coveredDays(job.start, job.end)
       const result = await analyzeSegment({
         llm: this.ctx.llm,
         attachments: this.ctx.get('attachments'),
         route: this.route,
-        files: shots.files,
-        start,
-        end,
+        files: job.files,
+        start: job.start,
+        end: job.end,
         days,
         budget: this.config.imageBudget,
         maxTokens: this.config.segmentMaxTokens,
         signal: this.lifetime.signal,
         logger: this.logger,
+        styles: { summaryStyle: this.config.summaryStyle, quipStyle: this.config.quipStyle },
+        jobId: job.id,
+        onModelCall: (event) => this.#recordModelCall(event),
       })
 
-      const day = dayKey(start)
       const file = await appendDetailSegment(this.store, {
         day,
-        start,
-        end,
+        start: job.start,
+        end: job.end,
         meta: `> ${result.meta}${days.length > 1 ? ` · 跨越 ${days.join('、')}` : ''}`,
         body: result.detail,
       })
 
       await this.#appendNote(day, {
-        from: start,
-        to: end,
+        jobId: job.id,
+        from: job.start,
+        to: job.end,
         days,
+        totalShots: job.files.length,
+        selectedImages: result.modelCall.selectedImages,
+        sentImages: result.modelCall.sentImages,
+        provider: this.route.provider,
+        model: this.route.model,
+        requestId: result.modelCall.id,
+        usage: result.usage,
+        detail: result.detail,
         highlights: result.highlights,
         quip: result.quip,
       })
 
-      this.ledger.cursor = end
-      this.ledger.cursorDay = dayKey(end)
+      this.ledger.cursor = Math.max(this.ledger.cursor, job.end)
+      this.ledger.cursorDay = dayKey(this.ledger.cursor)
       this.ledger.lastSummaryAt = Date.now()
       this.ledger.stats.segments += 1
       this.ledger.stats.lastError = null
+      this.ledger.pendingSummaries = this.ledger.pendingSummaries.filter((entry) => entry.id !== job.id)
       await this.#persist()
       this.failureStreak = 0
       this.nextRetryAt = 0
 
-      const removal = deleteScreenshots(this.store, shots.files, {
+      const removal = deleteScreenshots(this.store, job.files, {
         auditFile: path.join(this.store.logs, 'deletions.jsonl'),
       })
       this.ledger.stats.deletedShots += removal.deleted.length
       await this.#persist()
 
-      for (const kept of removal.kept) {
-        this.logger.warn('daily-secretary: kept %s (%s)', kept.path, kept.reason)
-      }
+      for (const kept of removal.kept) this.logger.warn('daily-secretary: kept %s (%s)', kept.path, kept.reason)
       this.logger.info(
         'daily-secretary: recorded %s → %s (%s), %s shots summarised, %s deleted',
-        stamp(start),
-        stamp(end),
-        reason,
-        shots.files.length,
-        removal.deleted.length,
+        stamp(job.start), stamp(job.end), job.reason, job.files.length, removal.deleted.length,
       )
-      return { file, ...result, deleted: removal.deleted.length }
+      return { ok: true, file, ...result, deleted: removal.deleted.length }
     } catch (error) {
       this.failureStreak += 1
-      this.nextRetryAt = Date.now() + Math.min(15 * 60_000, 60_000 * this.failureStreak)
+      this.nextRetryAt = Date.now() + this.config.deltaTSeconds * 1_000
+      job.lastAttemptAt = Date.now()
+      job.lastError = { code: error?.code ?? null, message: String(error?.message ?? error) }
       this.ledger.stats.failures += 1
-      this.ledger.stats.lastError = String(error?.message ?? error)
+      this.ledger.stats.lastError = job.lastError.message
       await this.#persist()
-      this.logger.error('daily-secretary: summary failed, screenshots kept (%s)', error?.message ?? error)
-      return { skipped: true, reason: 'error' }
-    } finally {
-      this.busy = false
+      this.logger.error('daily-secretary: summary failed; kept %s screenshots in the retry queue (%s: %s)', job.files.length, job.lastError.code ?? 'ERROR', job.lastError.message)
+      return { ok: false, error: job.lastError }
     }
   }
 
@@ -885,12 +1206,17 @@ class Secretary {
   // ------------------------------------------------------------------- digest
 
   async #digestTick() {
-    if (this.disposed || this.ledger === null || this.busy) return
+    if (this.disposed || this.recovering || this.ledger === null || this.busy) return
     const now = Date.now()
     const day = dayKey(now)
     const minutes = parseClock(this.config.dailyDigestAt)
     const reached = clockReached(now, minutes)
     if (now < this.digestRetryAt) return
+
+    if (this.ledger.pendingDigests.some((job) => job.day === day)) {
+      await this.#produceDigest({ day, reason: 'retry', now })
+      return
+    }
 
     if (reached && this.ledger.digestDay !== day) {
       await this.#produceDigest({ day, reason: 'scheduled', now })
@@ -914,6 +1240,7 @@ class Secretary {
   async #produceDigest({ day, reason, now }) {
     const notes = this.readNotes(day)
     if (notes.length === 0) {
+      this.ledger.pendingDigests = this.ledger.pendingDigests.filter((job) => job.day !== day)
       this.logger.info('daily-secretary: no work recorded for %s, skipping the daily piece', day)
       this.ledger.digestDay = day
       this.ledger.digestAt = now
@@ -928,12 +1255,22 @@ class Secretary {
       }
     }
 
-    if (this.route === null) return null
     const todayNotes = this.readNotes(day)
     if (todayNotes.length === 0) return null
 
+    let job = this.ledger.pendingDigests.find((entry) => entry.day === day)
+    if (job === undefined) {
+      job = { id: randomUUID(), day, queuedAt: Date.now(), attempts: 0, lastAttemptAt: null, lastError: null }
+      this.ledger.pendingDigests.push(job)
+    }
+    job.attempts += 1
+    job.lastAttemptAt = Date.now()
+    job.lastError = null
+    await this.#persist()
+
     this.busy = true
     try {
+      if (this.route === null) throw Object.assign(new Error('没有可用的模型路由'), { code: 'NO_MODEL_ROUTE' })
       const digest = await composeDailyDigest({
         llm: this.ctx.llm,
         route: this.route,
@@ -941,6 +1278,9 @@ class Secretary {
         segments: todayNotes,
         maxTokens: this.config.dailySummaryMaxTokens,
         signal: this.lifetime.signal,
+        jobId: job.id,
+        styles: { summaryStyle: this.config.summaryStyle, quipStyle: this.config.quipStyle },
+        onModelCall: (event) => this.#recordModelCall(event),
       })
       await writeDailyDigest(this.store, {
         day,
@@ -952,14 +1292,15 @@ class Secretary {
       })
       this.ledger.digestDay = day
       this.ledger.digestAt = now
+      this.ledger.pendingDigests = this.ledger.pendingDigests.filter((entry) => entry.id !== job.id)
       if (reason === 'scheduled' || reason === 'manual') this.ledger.panelAt = now
       await this.#persist()
+      this.digestRetryAt = 0
       this.logger.info('daily-secretary: daily piece ready for %s (%s)', day, reason)
       return digest
     } catch (error) {
-      // Never leave the card blank: fall back to a card built from the recorded
-      // highlights, and try the model again on the next refresh window.
-      this.digestRetryAt = now + 10 * 60_000
+      job.lastError = { code: error?.code ?? null, message: String(error?.message ?? error) }
+      this.digestRetryAt = Date.now() + 10 * 60_000
       const fallback = fallbackDigest(todayNotes)
       await writeDailyDigest(this.store, {
         day,
@@ -973,7 +1314,7 @@ class Secretary {
       this.ledger.digestAt = now
       if (reason === 'scheduled' || reason === 'manual') this.ledger.panelAt = now
       await this.#persist()
-      this.logger.error('daily-secretary: daily piece fell back to highlights (%s)', error?.message ?? error)
+      this.logger.error('daily-secretary: daily piece failed and was queued for retry (%s: %s)', job.lastError.code ?? 'ERROR', job.lastError.message)
       return fallback
     } finally {
       this.busy = false
@@ -1063,11 +1404,13 @@ class Secretary {
       case 'record': {
         // "Summarise what you have right now" without waiting for the edge.
         if (this.ledger === null) return { ok: false, error: 'not ready' }
+        if (this.recovering) return { ok: false, error: '正在整理上次的记录，请稍后再操作' }
         const now = Date.now()
         await this.#summarize({ start: this.ledger.cursor, end: now, reason: 'manual' })
         return { ok: true, state: this.#state() }
       }
       case 'refresh': {
+        if (this.recovering) return { ok: false, error: '正在整理上次的记录，请稍后再操作' }
         const now = Date.now()
         await this.#produceDigest({ day: dayKey(now), reason: 'manual', now })
         return { ok: true, state: this.#state() }
@@ -1103,10 +1446,14 @@ class Secretary {
         dailyDigestAt: this.config.dailyDigestAt,
         captureIntervalSeconds: this.config.captureIntervalSeconds,
         imageBudget: this.config.imageBudget,
+        summaryStyle: this.config.summaryStyle,
+        quipStyle: this.config.quipStyle,
       },
       scrabber: this.runner?.snapshot() ?? null,
       widget: this.widget?.snapshot() ?? { available: false },
       stats: this.ledger?.stats ?? null,
+      pendingSummaries: this.ledger?.pendingSummaries ?? [],
+      pendingDigests: this.ledger?.pendingDigests ?? [],
       store: this.store.root,
       today: dayKey(Date.now()),
       notes: this.readNotes(dayKey(Date.now())).length,
@@ -1123,10 +1470,12 @@ class Secretary {
  */
 export async function apply(ctx, raw) {
   const config = parseConfig(raw)
-  const store = resolveStore({ rootDir: config.dataDir ?? PLUGIN_DIR })
+  const store = resolveStore({ rootDir: config.dataDir ?? userDataDir() })
+  const migrated = config.dataDir === null ? migrateLegacyData(PLUGIN_DIR, store) : false
   ensureStore(store)
   const logger = createLogger(ctx, store.logs)
-  const secretary = new Secretary(ctx, config, logger)
+  if (migrated) logger.info('daily-secretary: moved existing data into %s', store.root)
+  const secretary = new Secretary(ctx, config, logger, store)
 
   ctx.effect(() => async () => {
     await secretary.dispose()
@@ -1186,7 +1535,7 @@ async function registerTool(ctx, secretary, logger) {
         },
         target: {
           type: 'string',
-          enum: ['screenshots', 'diary'],
+          enum: ['home', 'screenshots', 'diary'],
           description: 'For action=open: which folder of this plugin to reveal.',
         },
         day: {
@@ -1208,6 +1557,14 @@ async function registerTool(ctx, secretary, logger) {
         model: {
           type: 'string',
           description: 'For action=configure: model id inside that provider. Send an empty string to follow the profile default.',
+        },
+        summaryStyle: {
+          type: 'string',
+          description: 'For action=configure: preferred writing style for summaries (up to 500 characters).',
+        },
+        quipStyle: {
+          type: 'string',
+          description: 'For action=configure: preferred tone for quips (up to 500 characters).',
         },
       },
       output: {
@@ -1273,7 +1630,7 @@ async function registerTool(ctx, secretary, logger) {
           }
         }
         if (action === 'open') {
-          const target = args?.target === 'diary' ? 'diary' : 'screenshots'
+          const target = ['home', 'screenshots', 'diary'].includes(args?.target) ? args.target : 'screenshots'
           const result = secretary.openFolder(target)
           if (result.ok !== true) return { text: `打开失败：${result.error}` }
           return { text: `已在文件管理器中打开 ${result.directory}` }
@@ -1283,12 +1640,14 @@ async function registerTool(ctx, secretary, logger) {
           if (typeof args?.captureSeconds === 'number') patch.captureIntervalSeconds = Math.round(args.captureSeconds)
           if (typeof args?.deltaTMinutes === 'number') patch.deltaTSeconds = Math.round(args.deltaTMinutes * 60)
           if (typeof args?.dailyDigestAt === 'string' && args.dailyDigestAt !== '') patch.dailyDigestAt = args.dailyDigestAt
+          if (typeof args?.summaryStyle === 'string') patch.summaryStyle = args.summaryStyle
+          if (typeof args?.quipStyle === 'string') patch.quipStyle = args.quipStyle
           if (typeof args?.provider === 'string' || typeof args?.model === 'string') {
             patch.provider = args?.provider ?? ''
             patch.model = args?.model ?? ''
           }
           if (Object.keys(patch).length === 0) {
-            return { text: '没有给出要修改的项（captureSeconds / deltaTMinutes / dailyDigestAt / provider+model）。' }
+            return { text: '没有给出要修改的项（captureSeconds / deltaTMinutes / dailyDigestAt / provider+model / summaryStyle / quipStyle）。' }
           }
           const result = await secretary.applySettings(patch)
           if (result.ok !== true) return { text: `保存失败：${result.error}` }
