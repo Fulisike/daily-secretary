@@ -1,0 +1,8 @@
+# daily-secretary: screen recorder + work diary + desktop dot.
+#
+# Storage defaults to this package's own directory, so `screenshots/`, `diary/`,
+# `state/` and `logs/` appear next to the plugin unless dataDir overrides it.
+- insert:
+    - id: daily-secretary
+      name: daily-secretary
+      config: {}

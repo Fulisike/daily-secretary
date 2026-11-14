@@ -1,0 +1,10 @@
+# Runtime data — never commit a user's screen recordings or diary.
+screenshots/
+diary/
+state/
+logs/
+bin/
+
+# Build output
+native/widget/target/
+node_modules/

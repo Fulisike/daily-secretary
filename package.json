@@ -1,0 +1,50 @@
+{
+  "name": "daily-secretary",
+  "version": "1.0.0",
+  "private": true,
+  "os": [
+    "win32"
+  ],
+  "type": "module",
+  "description": "Keeps a round always-on-top desktop dot that records the screen through scrabber, and turns those screenshots into a detailed work diary plus one short daily piece.",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "bin/daily-secretary-widget-standalone.exe",
+    "bin/scrabber-standalone.exe",
+    "scripts",
+    "native/widget/Cargo.toml",
+    "native/widget/src"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "build:native": "node scripts/build-native.mjs",
+    "install:scrabber": "node scripts/install-scrabber.mjs"
+  }
+}

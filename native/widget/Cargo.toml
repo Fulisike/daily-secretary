@@ -1,0 +1,37 @@
+[package]
+name = "daily-secretary-widget"
+version = "0.1.0"
+edition = "2021"
+description = "Always-on-top desktop companion dot for the daily-secretary DSH plugin"
+license = "MIT"
+
+[[bin]]
+name = "daily-secretary-widget"
+path = "src/main.rs"
+
+[dependencies]
+# wgpu rather than the default glow: its DX12/Metal/Vulkan surface path is the
+# one that composites per-pixel alpha correctly, which a rounded overlay needs.
+# glow stays enabled as a fallback renderer.
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

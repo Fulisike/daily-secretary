@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300" width="640" height="300" role="img" aria-label="A green recording dot and a yellow paused dot on the left, an arrow, and the expanded daily card on the right">
+  <defs>
+    <linearGradient id="rec" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4ADE80"/>
+      <stop offset="1" stop-color="#22A34E"/>
+    </linearGradient>
+    <linearGradient id="pau" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FCD34D"/>
+      <stop offset="1" stop-color="#E0A800"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(96 108) scale(78)">
+      <stop offset="0.55" stop-color="#34C759" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#34C759" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E2229"/>
+      <stop offset="1" stop-color="#14171C"/>
+    </linearGradient>
+  </defs>
+
+  <!-- recording dot -->
+  <circle cx="96" cy="108" r="78" fill="url(#halo)"/>
+  <circle cx="96" cy="108" r="52" fill="url(#rec)"/>
+  <circle cx="96" cy="108" r="52" fill="none" stroke="#7BE79C" stroke-opacity="0.5" stroke-width="2.5"/>
+  <circle cx="96" cy="108" r="12" fill="#F7FFF9"/>
+  <circle cx="96" cy="108" r="70" fill="none" stroke="#34C759" stroke-opacity="0.28" stroke-width="2"/>
+
+  <!-- paused dot -->
+  <circle cx="96" cy="228" r="34" fill="url(#pau)"/>
+  <circle cx="96" cy="228" r="34" fill="none" stroke="#FFE28A" stroke-opacity="0.55" stroke-width="2"/>
+  <rect x="88" y="216" width="5" height="24" rx="2" fill="#1A1610" fill-opacity="0.85"/>
+  <rect x="99" y="216" width="5" height="24" rx="2" fill="#1A1610" fill-opacity="0.85"/>
+
+  <!-- morph arrow -->
+  <g fill="none" stroke="#8A8F98" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.85">
+    <path d="M176 168 H 220"/>
+    <path d="M210 158 L 221 168 L 210 178"/>
+  </g>
+
+  <!-- expanded card -->
+  <rect x="248" y="36" width="344" height="228" rx="20" fill="url(#card)" stroke="#34C759" stroke-width="3"/>
+  <rect x="248" y="36" width="344" height="48" rx="20" fill="#34C759" fill-opacity="0.10"/>
+  <path d="M248 84 H 592" stroke="#8A8F98" stroke-opacity="0.28" stroke-width="1.5"/>
+
+  <!-- back button -->
+  <g fill="none" stroke="#B9C0C8" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M280 54 L 271 60 L 280 66"/>
+  </g>
+  <!-- pause button -->
+  <g fill="#B9C0C8">
+    <rect x="538" y="52" width="4" height="16" rx="1.6"/>
+    <rect x="546" y="52" width="4" height="16" rx="1.6"/>
+  </g>
+  <!-- close button -->
+  <g stroke="#B9C0C8" stroke-width="2.6" stroke-linecap="round">
+    <path d="M568 52 L 578 62"/>
+    <path d="M578 52 L 568 62"/>
+  </g>
+
+  <!-- title bar lines -->
+  <rect x="322" y="54" width="86" height="9" rx="4.5" fill="#E8EAED" fill-opacity="0.9"/>
+
+  <!-- body lines -->
+  <g fill="#C7CCD3" fill-opacity="0.85">
+    <rect x="276" y="106" width="288" height="8" rx="4"/>
+    <rect x="276" y="124" width="266" height="8" rx="4"/>
+    <rect x="276" y="142" width="234" height="8" rx="4"/>
+    <rect x="276" y="168" width="288" height="8" rx="4"/>
+    <rect x="276" y="186" width="252" height="8" rx="4"/>
+    <rect x="276" y="204" width="200" height="8" rx="4"/>
+  </g>
+
+  <!-- scrollbar -->
+  <rect x="576" y="98" width="5" height="52" rx="2.5" fill="#8A8F98" fill-opacity="0.45"/>
+
+  <!-- footer status -->
+  <circle cx="284" cy="240" r="5" fill="#34C759"/>
+  <rect x="296" y="236" width="104" height="7" rx="3.5" fill="#8A8F98" fill-opacity="0.8"/>
+</svg>
